@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 INPUT_CSV  = "generations_gpt-4o_gsm8k_with_answers.csv"   # <-- your input file
 OUTPUT_CSV = "gsmgpt_4o_results.csv"                   # <-- set "" to skip saving
 
-# HCR-W+++ knobs (tunable but safe)
+
 CLUSTER_MIN_LEN = 2          # ignore paths with <2 steps inside cluster scoring
 CLUSTER_MAX_LEN = 120        # ignore paths with >120 steps inside cluster scoring
 PENALIZE_NO_MAJ  = True      # penalize clusters with no majority-supported bins
@@ -506,7 +506,7 @@ def run_all(input_csv: str, output_csv: str = ""):
     results.append(evaluate(questions, pick_top_probability, "Top-Probability"))
     results.append(evaluate(questions, pick_self_consistency, "Self-Consistency (MV)"))
     results.append(evaluate(questions, pick_scw, "Semantic Self-Consistency (SCW)"))
-    results.append(evaluate(questions, pick_hcrw, "HCR-W+++ (global-K, contrastive, weighted)"))
+    results.append(evaluate(questions, pick_hcrw, "HCR-W (global-K, contrastive, weighted)"))
 
     print("\n=== Comparison ===")
     width = 48
@@ -523,7 +523,7 @@ def run_all(input_csv: str, output_csv: str = ""):
             "Top-Probability": "top_probability",
             "Self-Consistency (MV)": "self_consistency",
             "Semantic Self-Consistency (SCW)": "scw",
-            "HCR-W+++ (global-K, contrastive, weighted)": "hcrw"
+            "HCR-W (global-K, contrastive, weighted)": "hcrw"
         }
         for r in results:
             key = name_to_key[r["name"]]
