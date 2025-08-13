@@ -1,5 +1,4 @@
-# compare_four_methods_notebook.py — single Jupyter cell
-# -*- coding: utf-8 -*-
+
 
 import re
 import math
@@ -16,8 +15,8 @@ from tqdm.auto import tqdm
 # =========================
 # Config (set these and run)
 # =========================
-INPUT_CSV  = "generations_gpt-4o_gsm8k_with_answers.csv"   # <-- your input file
-OUTPUT_CSV = "gsmgpt_4o_results.csv"                   # <-- set "" to skip saving
+INPUT_CSV  = "generations_gpt-4o_gsm8k_with_answers.csv"   
+OUTPUT_CSV = "gsmgpt_4o_results.csv"                   
 
 
 CLUSTER_MIN_LEN = 2          # ignore paths with <2 steps inside cluster scoring
