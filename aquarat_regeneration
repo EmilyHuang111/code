@@ -1,0 +1,243 @@
+import os
+import time
+import asyncio
+import csv
+import sys
+import pandas as pd
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from huggingface_hub import login
+
+
+# --- Generation Configuration ---
+MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.1"
+N_PATHS = 20
+MAX_RETRIES = 3
+# BATCH_SIZE determines how many prompts are sent to the GPU at once.
+# Adjust this based on your GPU's VRAM. Start with 4 or 8.
+# If you get an "Out of Memory" error, lower this value.
+BATCH_SIZE = 8
+
+# --- Generation Parameters ---
+TEMPERATURE = 0.7
+TOP_P = 0.9
+MAX_TOKENS = 1000
+REPETITION_PENALTY = 1.15
+NO_REPEAT_NGRAM_SIZE = 3
+
+# --- File Configuration ---
+# Note: Changed input path to be relative to the script's location.
+INPUT_CSV = "aqua_rat_test_qna.csv"
+OUTPUT_CSV = "generations_mistral7b_aqua_batched.csv"
+
+
+FEW_SHOT_EXAMPLES = r"""
+Q: John found that the average of 15 numbers is 40. If 10 is added to each number then the mean of
+the numbers is?
+Answer Choices: (a) 50 (b) 45 (c) 65 (d) 78 (e) 64
+A: If 10 is added to each number, then the mean of the numbers also increases by 10. So the new
+mean would be 50. The answer is (a).
+
+Q: If a / b = 3/4 and 8a + 5b = 22, then find the value of a.
+Answer Choices: (a) 1/2 (b) 3/2 (c) 5/2 (d) 4/2 (e) 7/2
+A: If a / b = 3/4, then b = 4a / 3. So 8a + 5(4a / 3) = 22. This simplifies to 8a + 20a / 3 = 22, which
+means 44a / 3 = 22. So a is equal to 3/2. The answer is (b).
+
+Q: A person is traveling at 20 km/hr and reached his destination in 2.5 hr. Find the distance.
+Answer Choices: (a) 53 km (b) 55 km (c) 52 km (d) 60 km (e) 50 km
+A: The distance that the person traveled would have been 20 km/hr * 2.5 hrs = 50 km. The answer is
+(e).
+
+Q: How many keystrokes are needed to type the numbers from 1 to 500?
+Answer Choices: (a) 1156 (b) 1392 (c) 1480 (d) 1562 (e) 1788
+A: There are 9 one-digit numbers from 1 to 9. There are 90 two-digit numbers from 10 to 99. There
+are 401 three-digit numbers from 100 to 500. 9 + 90(2) + 401(3) = 1392. The answer is (b).
+""".strip()
+
+def build_prompt(q: str) -> str:
+    """Builds the instruction-following prompt for the Mistral model."""
+    return f"<s>[INST] {FEW_SHOT_EXAMPLES}\n\nQ: {q}\nA: [/INST]"
+
+# Global model and tokenizer to be loaded once
+tokenizer = None
+generator = None
+
+def load_model():
+    """Loads the tokenizer and model onto the GPU."""
+    global tokenizer, generator
+
+    if not torch.cuda.is_available():
+        print("❌ CUDA GPU not available. This script requires a GPU.")
+        return False
+
+    print("🔄 Loading Mistral 7B model...")
+    print(f"   GPU: {torch.cuda.get_device_name()}")
+    print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left" # Important for batch generation
+
+    # Create a text-generation pipeline
+    generator = pipeline(
+        "text-generation",
+        model=MODEL_NAME,
+        tokenizer=tokenizer,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    print("✅ Model loaded successfully!")
+    return True
+
+# Global counters for progress tracking
+total_generated = 0
+total_saved = 0
+
+async def process_question(idx: int, row, writer: csv.DictWriter, fh, done: int, total_problems: int):
+    """
+    Manages BATCHED generation for a single question. This is much more efficient.
+    """
+    global total_saved, total_generated, generator
+
+    needed = N_PATHS - done
+    if needed <= 0:
+        return
+
+    # 1. Create all prompts for the current question
+    prompts = [build_prompt(row["question"]) for _ in range(needed)]
+    
+    completed_for_question = 0
+    
+    # 2. Process prompts in batches
+    for i in range(0, len(prompts), BATCH_SIZE):
+        batch_prompts = prompts[i:i + BATCH_SIZE]
+        
+        try:
+            # 3. Send the entire batch to the generator
+            outputs = generator(
+                batch_prompts,
+                max_new_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+                repetition_penalty=REPETITION_PENALTY,
+                no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+
+            # 4. Process and save the results from the batch
+            for j, output in enumerate(outputs):
+                generated_text = output[0]['generated_text'].strip()
+                
+                gid = done + i + j + 1
+                result = {
+                    "problem_id": idx,
+                    "question": row["question"],
+                    "ground_truth": row["answer"],
+                    "model": MODEL_NAME.split('/')[-1],
+                    "generation_id": gid,
+                    "generated_path": generated_text.replace('"', '""'),
+                }
+                writer.writerow(result)
+                
+                completed_for_question += 1
+                total_saved += 1
+                total_generated += 1
+
+            # Flush to disk after each successful batch
+            fh.flush()
+            os.fsync(fh.fileno())
+            print(f"   💾 Saved batch for Q{idx+1}. Paths completed: {completed_for_question}/{needed}", flush=True)
+
+        except Exception as e:
+            print(f"   ⚠️ A batch failed for Q{idx+1}: {e}", flush=True)
+            # Optional: Add retry logic for the failed batch here if needed
+            
+    print(f"✅ Q{idx+1}/{total_problems} complete: {done + completed_for_question}/{N_PATHS} paths saved to {OUTPUT_CSV}")
+
+
+async def main():
+    """Main function to orchestrate the data loading and generation process."""
+    global total_saved
+
+    if not load_model():
+        sys.exit(1)
+
+    # Ensure the data directory exists
+    data_dir = "data"
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+        print(f"Created '{data_dir}' directory. Please add your '{os.path.basename(INPUT_CSV)}' file inside it.")
+        sys.exit(1)
+
+    if not os.path.exists(INPUT_CSV):
+        print(f"❌ Input file not found: {INPUT_CSV}")
+        sys.exit(1)
+        
+    df = pd.read_csv(INPUT_CSV)
+    total_problems = len(df)
+
+    if os.path.exists(OUTPUT_CSV):
+        prev = pd.read_csv(OUTPUT_CSV)
+        done_counts = prev.groupby("problem_id").size().to_dict()
+        initial_saved = len(prev)
+    else:
+        done_counts = {}
+        initial_saved = 0
+    total_saved = initial_saved
+
+    print("-" * 60)
+    print(f"📊 Starting BATCHED generation:")
+    print(f"   Dataset: {INPUT_CSV} ({total_problems} problems)")
+    print(f"   Batch Size: {BATCH_SIZE}")
+    print(f"   Already completed: {initial_saved} paths")
+    print(f"   Output: {OUTPUT_CSV}")
+    print("-" * 60)
+
+    try:
+        with open(OUTPUT_CSV, "a", newline="", encoding="utf8", buffering=1) as f:
+            fieldnames = ["problem_id", "question", "ground_truth", "model", "generation_id", "generated_path"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if f.tell() == 0:
+                writer.writeheader()
+
+            for idx, row in df.iterrows():
+                done = done_counts.get(idx, 0)
+                if done >= N_PATHS:
+                    print(f"⏩ Skip Q{idx+1}/{total_problems} (already has {done} paths)")
+                    continue
+
+                print(f"🔄 Q{idx+1}/{total_problems}: Generating {N_PATHS - done} more paths...", flush=True)
+                # The async is less critical now since the GPU does heavy lifting in batches,
+                # but we keep the structure.
+                await process_question(idx, row, writer, f, done, total_problems)
+
+    except KeyboardInterrupt:
+        print(f"\n⏸️ Interrupted by user — progress safely saved.")
+
+    finally:
+        final_count = len(pd.read_csv(OUTPUT_CSV)) if os.path.exists(OUTPUT_CSV) else 0
+        print("\n" + "=" * 60)
+        print("✅ GENERATION COMPLETE!")
+        print(f"   📊 Total paths generated in session: {total_generated}")
+        print(f"   💾 Total paths saved in file: {final_count}")
+        print(f"   📁 Output file: {OUTPUT_CSV}")
+        print("=" * 60)
+
+if __name__ == "__main__":
+    import asyncio
+    try:
+        # If we're in a notebook, an event loop is already running.
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            import nest_asyncio
+            nest_asyncio.apply()
+            # In a notebook cell you can do:
+            await main()  # <-- works in Jupyter/Colab
+        else:
+            asyncio.run(main())
+    except RuntimeError:
+        # No running loop (regular Python process)
+        asyncio.run(main())
